@@ -215,20 +215,51 @@ final class AulaDevice {
         try commandExchange(Self.packet(0x04, 0x02))
     }
 
-    private func commandExchange(_ packet: [UInt8]) throws {
-        try Self.setReport(
-            device: commandDevice,
-            type: kIOHIDReportTypeFeature,
-            reportID: 0,
-            bytes: packet,
-            operation: "SET_REPORT"
-        )
+    // Observed the evening of 2026-08-24: this device intermittently fails
+    // GET_REPORT (and occasionally SET_REPORT) with timeout-flavored
+    // IOReturn codes (0xe00002d6, 0x800020b, 0x8000206) under sustained
+    // command traffic, including mid-factoryReset.
+    // 0xe00002d6 specifically was already root-caused in an earlier session
+    // (see project memory "factory-reset-reboot-fix"): the 0x04/0xf0 "apply"
+    // command makes the keyboard reboot mid-sequence, dropping the open HID
+    // connection out from under any commands still in flight on it - normal
+    // single-shot operations don't hit this because each calls
+    // AulaDevice.connect() fresh, but factoryReset sends several 0x04/0xf0
+    // commands within one long-lived connection. That
+    // session fixed it with an explicit reconnect (close + rematch + reopen)
+    // after a reboot-flavored failure. This is a simpler same-handle retry
+    // instead - empirically it got every operation through on this same
+    // hardware tonight, including full factoryReset, but if it ever proves
+    // insufficient the reconnect approach is
+    // the known-correct fix, not more retries.
+    @discardableResult
+    private func commandExchange(_ packet: [UInt8]) throws -> [UInt8] {
+        var lastError: Error?
+        for attempt in 1...6 {
+            do {
+                try Self.setReport(
+                    device: commandDevice,
+                    type: kIOHIDReportTypeFeature,
+                    reportID: 0,
+                    bytes: packet,
+                    operation: "SET_REPORT"
+                )
+                return try Self.getFeatureReport(device: commandDevice)
+            } catch {
+                lastError = error
+                guard attempt < 6 else { break }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+        }
+        throw lastError!
+    }
 
+    private static func getFeatureReport(device: IOHIDDevice) throws -> [UInt8] {
         var response = [UInt8](repeating: 0, count: AulaConstants.commandLength)
         var responseLength = response.count
         let result = response.withUnsafeMutableBufferPointer { pointer in
             IOHIDDeviceGetReport(
-                commandDevice,
+                device,
                 kIOHIDReportTypeFeature,
                 0,
                 pointer.baseAddress!,
@@ -238,19 +269,35 @@ final class AulaDevice {
         guard result == kIOReturnSuccess else {
             throw AulaError.hidFailed("GET_REPORT", Int32(result))
         }
+        return Array(response.prefix(responseLength))
+    }
+
+    /// setReport with a few retries on transient failures - see the note on
+    /// commandExchange. Used for the raw (unverified) page writes in
+    /// sendZeroPages, which call setReport directly rather than through
+    /// commandExchange.
+    private static func setReportWithRetry(
+        device: IOHIDDevice,
+        bytes: [UInt8],
+        operation: String,
+        attempts: Int = 6
+    ) throws {
+        for attempt in 1...attempts {
+            do {
+                try Self.setReport(device: device, type: kIOHIDReportTypeFeature, reportID: 0, bytes: bytes, operation: operation)
+                return
+            } catch {
+                guard attempt < attempts else { throw error }
+                Thread.sleep(forTimeInterval: 0.2)
+            }
+        }
     }
 
     private func sendZeroPages(_ count: Int) throws {
         guard count > 0 else { return }
         let zero = [UInt8](repeating: 0, count: AulaConstants.commandLength)
         for _ in 0..<(count - 1) {
-            try Self.setReport(
-                device: commandDevice,
-                type: kIOHIDReportTypeFeature,
-                reportID: 0,
-                bytes: zero,
-                operation: "zero page"
-            )
+            try Self.setReportWithRetry(device: commandDevice, bytes: zero, operation: "zero page")
             Thread.sleep(forTimeInterval: 0.04)
         }
         try commandExchange(zero)
