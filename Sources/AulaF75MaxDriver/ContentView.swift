@@ -515,7 +515,6 @@ private struct AppBackground: View {
                 .blur(radius: 100)
                 .offset(x: 460, y: 180)
         }
-        .ignoresSafeArea()
     }
 }
 
