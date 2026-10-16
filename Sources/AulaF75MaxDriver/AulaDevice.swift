@@ -244,7 +244,7 @@ final class AulaDevice {
                     bytes: packet,
                     operation: "SET_REPORT"
                 )
-                return try Self.getFeatureReport(device: commandDevice)
+                return try waitForReady(after: packet)
             } catch {
                 lastError = error
                 guard attempt < 6 else { break }
@@ -252,6 +252,32 @@ final class AulaDevice {
             }
         }
         throw lastError!
+    }
+
+    // The firmware needs time to apply each packet before the next one
+    // arrives. Reading the reply once, immediately, made clock sync a no-op
+    // on some units (issue #7). Instead, poll GET_REPORT until the device
+    // echoes this command's two header bytes with byte[3] == 0x01 ("ready").
+    // Data packets (e.g. the time payload) are echoed verbatim and never set
+    // the flag, so on timeout we return the last reply instead of throwing -
+    // the wait itself is still applied to them.
+    private func waitForReady(after packet: [UInt8]) throws -> [UInt8] {
+        let pollInterval = 0.05
+        let maxPolls = 6
+
+        var reply: [UInt8] = []
+        for _ in 0..<maxPolls {
+            Thread.sleep(forTimeInterval: pollInterval)
+            reply = try Self.getFeatureReport(device: commandDevice)
+            let isReady = reply.count > 3
+                && reply[0] == packet[0]
+                && reply[1] == packet[1]
+                && reply[3] == 0x01
+            if isReady {
+                return reply
+            }
+        }
+        return reply
     }
 
     private static func getFeatureReport(device: IOHIDDevice) throws -> [UInt8] {
